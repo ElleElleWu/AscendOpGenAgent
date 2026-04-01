@@ -4,7 +4,7 @@ description: >
   性能优化 SubAgent — 接收已有的 Triton 算子实现，分析性能瓶颈，
   应用优化策略，通过自动调优达到目标加速比。
   **重要约束**：
-  1. 必须通过 kernel-verifier skill 进行功能、精度和性能测试，观察真实测试结果，
+  1. 必须通过 kernel-verifier subagent 进行功能、精度和性能测试，观察真实测试结果，
      不得未经测试就自己编造、汇报结果
   2. 任务完成后必须主动结束并向主 Agent 汇报结果，不得停留等待
   3. **优化成功的最低底线：性能必须超过基线 triton 实现 5%，否则认定为失败**
@@ -16,8 +16,10 @@ tools:
   bash: true
   skill: true
   read: true
+  task: true
 skills:
   - latency-optimizer
+subagents:
   - kernel-verifier
 argument-hint: >
   必需：task-file-path、code-file-path、arch、output-path。
@@ -52,7 +54,7 @@ argument-hint: >
            └─────────────────┬───────────────┘
                              ↓
            ┌─────────────────────────────────┐
-           │ 5. 验证 (kernel-verifier)       │ ← skill
+           │ 5. 验证 (kernel-verifier)       │ ← subagent
            │  生成三种文件，执行两次比对        │
            │  - PyTorch vs 原始 Triton        │
            │  - PyTorch vs 优化 Triton        │
@@ -81,7 +83,7 @@ argument-hint: >
 
 **⚠️ 关键说明**：
 - Step 5 验证阶段需要生成三种文件（PyTorch、原始 Triton、优化 Triton）并执行两次 PyTorch vs Triton 比对
-- 由于 kernel-verifier skill 没有直接对比 triton vs triton 的接口，通过以下方式间接获取优化效果：
+- 由于 kernel-verifier subagent 没有直接对比 triton vs triton 的接口，通过以下方式间接获取优化效果：
   1. **第一次比对**：PyTorch vs 原始 Triton → 获取基线 triton 算子性能
   2. **第二次比对**：PyTorch vs 优化 Triton → 获取优化后 triton 算子性能
   3. **性能对比**：将两次比对的数值进行对比，即可得出优化效果
@@ -168,13 +170,13 @@ argument-hint: >
 
 ---
 
-### Step 5: 验证（⚠️ 必须严格按 kernel-verifier skill 执行）
+### Step 5: 验证（⚠️ 必须严格按 kernel-verifier subagent 执行）
 
 **⚠️ 核心要求**：
 - 三种文件仅需符合 KernelBench 格式，**不包含测试驱动代码**
 - 测试用例和测试驱动由 `kernel-verifier` skill 负责生成和执行
 
-加载 `kernel-verifier` skill，按其指引执行验证流程。
+通过 `task` 工具调用 `kernel-verifier` subagent 执行验证流程。
 
 #### 三种文件
 
@@ -190,32 +192,48 @@ argument-hint: >
 
 #### 两次精度比对
 
-调用 `kernel-verifier` skill 执行两次比对（**测试用例由 kernel-verifier skill 负责生成**）：
+通过 `task` 工具调用 `kernel-verifier` subagent 执行两次比对（**测试用例由 kernel-verifier subagent 负责生成**）：
 
 1. **第一次比对**：PyTorch vs 原始 Triton
    - 比对文件：`{op_name}_torch.py` vs `{op_name}_triton_baseline.py`
    - 目的：验证原始 Triton 实现与 PyTorch 参考实现的精度一致性
    - **必须通过**，否则原始实现本身有问题
-   - **调用命令**：
-   ```bash
-   python3 <kernel-verifier路径>/scripts/verify.py \
-       --op_name <op_name> \
-       --verify_dir <验证目录> \
-       --triton_impl_name triton_baseline \
-       --timeout 900
+   - **调用方式**：
+   ```
+   task(
+     subagent_type="kernel-verifier",
+     description="验证 baseline {op_name}",
+     prompt="
+       generated-code-path: {baseline代码路径}
+       task-file-path: {torch参考实现路径}
+       op-name: {op_name}
+       verify-dir: {验证目录}
+       triton-impl-name: triton_baseline
+       run-benchmark: false
+     ",
+     run_in_background=false
+   )
    ```
 
 2. **第二次比对**：PyTorch vs 优化 Triton
    - 比对文件：`{op_name}_torch.py` vs `{op_name}_triton_optimized.py`
    - 目的：验证优化后的 Triton 实现与 PyTorch 参考实现的精度一致性
    - **必须通过**，否则优化引入了精度问题
-   - **调用命令**：
-   ```bash
-   python3 <kernel-verifier路径>/scripts/verify.py \
-       --op_name <op_name> \
-       --verify_dir <验证目录> \
-       --triton_impl_name triton_optimized \
-       --timeout 900
+   - **调用方式**：
+   ```
+   task(
+     subagent_type="kernel-verifier",
+     description="验证 optimized {op_name}",
+     prompt="
+       generated-code-path: {优化代码路径}
+       task-file-path: {torch参考实现路径}
+       op-name: {op_name}
+       verify-dir: {验证目录}
+       triton-impl-name: triton_optimized
+       run-benchmark: false
+     ",
+     run_in_background=false
+   )
    ```
 
 > **参数说明**：`--triton_impl_name` 指定 Triton 实现模块名（不含 `{op_name}_` 前缀），默认值为 `triton_ascend_impl`。performance optimizer 生成的文件使用 `triton_baseline` 和 `triton_optimized`，因此需要显式指定。
@@ -237,7 +255,7 @@ argument-hint: >
 
 **⚠️ 性能效果计算方式：通过两次 PyTorch vs Triton 比对间接获取**
 
-由于 kernel-verifier skill 没有直接对比 triton vs triton 的接口，性能效果通过以下方式间接获取：
+由于 kernel-verifier subagent 没有直接对比 triton vs triton 的接口，性能效果通过以下方式间接获取：
 1. **第一次比对**：PyTorch vs 原始 Triton → 记录基线 triton 算子性能（latency）
 2. **第二次比对**：PyTorch vs 优化 Triton → 记录优化后 triton 算子性能（latency）
 3. **性能对比**：将两次比对的 latency 数值进行对比，计算得出优化效果
@@ -253,25 +271,41 @@ argument-hint: >
 由于需要分别获取 baseline 和 optimized 的性能数据，需执行两次 benchmark：
 
 1. **第一次 benchmark**：获取原始 Triton 性能
-```bash
-python3 <kernel-verifier路径>/scripts/benchmark.py \
-    --op_name <op_name> \
-    --verify_dir <验证目录> \
-    --triton_impl_name triton_baseline \
-    --warmup <warmup> \
-    --repeats <repeats> \
-    --output {output-path}/opt_iter_{iteration}/baseline_perf_result.json
+```
+task(
+  subagent_type="kernel-verifier",
+  description="benchmark baseline {op_name}",
+  prompt="
+    generated-code-path: {baseline代码路径}
+    task-file-path: {torch参考实现路径}
+    op-name: {op_name}
+    verify-dir: {验证目录}
+    triton-impl-name: triton_baseline
+    warmup: {warmup}
+    repeats: {repeats}
+    perf-output-path: {output-path}/opt_iter_{iteration}/baseline_perf_result.json
+  ",
+  run_in_background=false
+)
 ```
 
 2. **第二次 benchmark**：获取优化后 Triton 性能
-```bash
-python3 <kernel-verifier路径>/scripts/benchmark.py \
-    --op_name <op_name> \
-    --verify_dir <验证目录> \
-    --triton_impl_name triton_optimized \
-    --warmup <warmup> \
-    --repeats <repeats> \
-    --output {output-path}/opt_iter_{iteration}/optimized_perf_result.json
+```
+task(
+  subagent_type="kernel-verifier",
+  description="benchmark optimized {op_name}",
+  prompt="
+    generated-code-path: {优化代码路径}
+    task-file-path: {torch参考实现路径}
+    op-name: {op_name}
+    verify-dir: {验证目录}
+    triton-impl-name: triton_optimized
+    warmup: {warmup}
+    repeats: {repeats}
+    perf-output-path: {output-path}/opt_iter_{iteration}/optimized_perf_result.json
+  ",
+  run_in_background=false
+)
 ```
 
 > **注意**：两次 benchmark 的 `--triton_impl_name` 参数分别指定为 `triton_baseline` 和 `triton_optimized`，以匹配 verify 目录下的文件名。
@@ -423,7 +457,7 @@ python3 <kernel-verifier路径>/scripts/benchmark.py \
 ```
 
 **关键设计**：
-- 每轮迭代有独立的 `opt_iter_{n}/` 目录（与 kernelgen-workflow 的 `iter_{n}/` 区分）
+- 每轮迭代有独立的 `opt_iter_{n}/` 目录（与 AKG-triton 的 `iter_{n}/` 区分）
 - 验证目录 `verify/` 在每轮迭代内独立
 - 验证目录包含三种文件：torch、triton_baseline、triton_optimized（**仅需符合 KernelBench 格式，不包含测试驱动**）
 - 顶层 `optimized_code.py` 和 `perf_result.json` 始终是最佳结果的副本
@@ -440,7 +474,7 @@ python3 <kernel-verifier路径>/scripts/benchmark.py \
 | 目标加速比 | 用户未指定时进行自动优化（无目标上限）；用户指定时需达到目标 |
 | 文件操作范围 | 所有文件操作限制在 output-path 内 |
 | 语言 | 所有思考、分析、日志必须使用中文 |
-| 文件格式 | verify/ 目录下的三种文件仅需符合 KernelBench 格式，**不包含测试驱动代码**（测试驱动由 kernel-verifier skill 负责） |
+| 文件格式 | verify/ 目录下的三种文件仅需符合 KernelBench 格式，**不包含测试驱动代码**（测试驱动由 kernel-verifier subagent 负责执行） |
 | 优化失败处理 | 达到最大迭代次数（3次）仍未达到目标时，**禁止输出优化报告**，立即向主 Agent 汇报优化失败 |
 
 ## 适用场景
@@ -451,7 +485,7 @@ python3 <kernel-verifier路径>/scripts/benchmark.py \
 - 功能已验证通过，需要提升性能
 
 ❌ **不推荐使用**：
-- 代码尚未通过功能验证（应先使用 kernelgen-workflow）
+- 代码尚未通过功能验证（应先使用 AKG-triton）
 - 算子实现有严重 bug（应先修复 bug）
 
 ## 性能指标

@@ -1,7 +1,7 @@
 ---
 name: benchmark-evaluator
 description: >
-  Benchmark Evaluator Skill — 串行执行算子评测任务，通过 task 工具调用 kernelgen-workflow
+  Benchmark Evaluator Skill — 串行执行算子评测任务，通过 task 工具调用 AKG-triton
   SubAgent 生成并验证代码，逐任务返回结果给调度 Agent。
 argument-hint: >
   必需：agent_name, agent_workspace, level_problems, benchmark_path (绝对路径), arch, npu_id, output_path (绝对路径)。
@@ -17,10 +17,10 @@ tools:
 # Benchmark Evaluator Skill
 
 <role>
-你是一个自动化评测任务执行器。你的任务是串行执行 KernelBench 评测任务，**通过 `task` 工具调用 `kernelgen-workflow` SubAgent** 生成并验证代码，逐任务返回结果给调度 Agent。
+你是一个自动化评测任务执行器。你的任务是串行执行 KernelBench 评测任务，**通过 `task` 工具调用 `AKG-triton` SubAgent** 生成并验证代码，逐任务返回结果给调度 Agent。
 
 **核心原则**：
-- 你**不负责**代码验证和性能测试（由 `kernelgen-workflow` SubAgent 内部完成）
+- 你**不负责**代码验证和性能测试（由 `AKG-triton` SubAgent 内部完成）
 - 你**只负责**任务扫描、调度 SubAgent、收集结果、逐任务汇报
 </role>
 
@@ -71,7 +71,7 @@ Phase 1: 初始化
 
 Phase 2: 串行执行（逐任务）
   └── 对于每个任务：
-      ├── 用 task 工具调用 kernelgen-workflow SubAgent
+      ├── 用 task 工具调用 AKG-triton SubAgent
       │     └── SubAgent 内部完成：代码生成 + 验证 + 性能测试
       ├── 读取 SubAgent 输出的 summary.json
       ├── 调用 evaluator.py save-result 保存结果
@@ -126,23 +126,22 @@ python3 <本skill所在目录>/evaluator.py scan \
 mkdir -p {output_path}/level_{level}/{problem_id}_{op_name}
 ```
 
-#### Step 2: 调用 kernelgen-workflow SubAgent
+#### Step 2: 调用 AKG-triton SubAgent
 
 ⚠️ **必须使用 `task` 工具**调用 SubAgent，不要使用 `opencode run` 或编造不存在的工具。
 
 ```
 task(
-  subagent_type="kernelgen-workflow",
-  load_skills=["kernel-designer", "kernel-generator", "kernel-verifier"],
+  subagent_type="AKG-triton",
   description="评测 Level{level} Problem{problem_id} {op_name} 算子",
-  prompt="任务文件路径: {task_file}\n输出路径: {output_path}/level_{level}/{problem_id}_{op_name}/\narch: {arch}\n框架: torch\n后端: ascend\nDSL: triton_ascend\nwarmup: {warmup}\nrepeats: {repeats}\n\n请直接执行生成和验证流程。",
+  prompt="task-file-path: {task_file}\noutput-path: {output_path}/level_{level}/{problem_id}_{op_name}/\narch: {arch}\nwarmup: {warmup}\nrepeats: {repeats}",
   run_in_background=false
 )
 ```
 
 **参数说明**：
-- `subagent_type`: 固定为 `kernelgen-workflow`
-- `load_skills`: 传 `["kernel-designer", "kernel-generator", "kernel-verifier"]`，显式加载 SubAgent 所需 skill
+- `subagent_type`: 固定为 `AKG-triton`
+- `prompt`: 包含 task-file-path、output-path、arch 等 AKG-triton 所需的结构化参数
 - `run_in_background`: 设为 `false`，同步等待完成
 
 #### Step 3: 收集结果
@@ -253,7 +252,7 @@ Skill 在传入的 `output_path` 目录下创建任务子目录：
 ├── level_{n}/                                      ← Skill 创建
 │   └── {problem_id}_{op_name}/                     ← Skill 创建
 │       ├── generated_code.py                       ← 最终验证通过的代码（仅验证通过时存在）
-│       ├── summary.json                            ← kernelgen-workflow 输出
+│       ├── summary.json                            ← AKG-triton 输出
 │       ├── perf_result.json                        ← 最终性能报告（仅验证通过时存在）
 │       └── iter_{n}/                               ← 各轮迭代（iter_0 始终存在）
 │           ├── generated_code.py
@@ -275,8 +274,8 @@ Skill 在传入的 `output_path` 目录下创建任务子目录：
 
 | 禁止 | 说明 |
 |------|------|
-| 自行调用 verify.py | 验证由 kernelgen-workflow SubAgent 内部完成 |
-| 自行调用 benchmark.py | 性能测试由 kernelgen-workflow SubAgent 内部完成 |
+| 自行调用 verify.py | 验证由 AKG-triton SubAgent 内部完成 |
+| 自行调用 benchmark.py | 性能测试由 AKG-triton SubAgent 内部完成 |
 | 使用 `opencode run` | 必须通过 `task` 工具调用 SubAgent |
 | 生成 agent_report.md | 报告由调度 Agent 负责 |
 | 维护 .benchmark_state.json | 状态由调度 Agent 维护 |

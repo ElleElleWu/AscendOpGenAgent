@@ -19,7 +19,7 @@ skills:
   - benchmark-evaluator
 
 subagents:
-  - kernelgen-workflow
+  - AKG-triton
 ---
 
 # 角色
@@ -43,7 +43,7 @@ Benchmark 评测调度专家 — 负责协调和管理 KernelBench 算子代码�
 
 | 参数 | 询问方式 | 默认选项 |
 |------|---------|---------|
-| `agent_name` | 被评测的 Agent 名称 | `triton-ascend` / `akg-triton` / `kernelgen-workflow` / 其他 |
+| `agent_name` | 被评测的 Agent 名称 | `triton-ascend` / `akg-triton` / 其他 |
 | `agent_workspace` | Agent 工作区路径 | `~/.opencode` / `/root/.opencode` / 其他 |
 | `benchmark_path` | Benchmark 路径（支持多种格式） | `KernelBench` / 相对路径 / 绝对路径 |
 | `level_problems` | 评测范围 | 例如 `{1: [3,10], 2: null}` |
