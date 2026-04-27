@@ -34,7 +34,7 @@ skills:
 
 ```
 Phase 0: 参数确认
-Phase 1: 任务构建          (op-task-extractor)
+Phase 1: 任务构建          (op-task-extractor / GPU Kernel 模式由 Agent 自建)
 Phase 2: 算法设计          (kernel-designer)
 Phase 3: 代码生成与验证    (kernel-generator 子 Agent + kernel-verifier 子 Agent, 迭代)
 Phase 4: 性能优化与验证    (kernel-analyzer 子 Agent + kernel-optimizer 子 Agent, 多轮迭代)
@@ -97,11 +97,25 @@ mkdir -p {工作目录}/output
 
 ### 模式 A：标准 KernelBench
 
-调用 `op-task-extractor` skill，从用户描述中构建 KernelBench 格式的任务描述文件。
+调用 `op-task-extractor` skill。skill 会先做模式判定（依据：源 `.py` 是否含 `get_input_groups` / 同目录是否存在同名 `.json`），再走对应分支：
 
-**产出**：`{工作目录}/{op_name}.py`
+#### A.1 单 case 子模式（典型来源：`benchmarks/KernelBench/`）
 
-验证通过后直接进入 Phase 2。
+- 源 `.py` 仅含 `get_inputs()`，`forward` 单组输入
+- skill 在工作目录构造单一自包含任务文件 `{op_name}.py`
+- 包含 `Model` + `get_inputs()` + `get_init_inputs()`，不含测试驱动
+
+#### A.2 多 case 子模式（典型来源：`benchmarks/level430/` 和 `benchmarks/NPUKernelBench/`）
+
+- 源 `.py` 含 `get_input_groups()`，**同目录**配套 `{op_name}.json`（JSONL，每行一个 case 输入规格）
+- skill **原样透传两个文件**到工作目录：
+  - `{工作目录}/{op_name}.py`（源 `.py` 字节级副本，禁止改写）
+  - `{工作目录}/{op_name}.json`（源 JSON 字节级副本，必须与 `.py` 同名同目录）
+- **严禁**将多 case 源裁剪为单 case 任务文件（会丢失 N-1 个 shape 的评测结果）
+
+**通用要求**：
+- 所有任务文件必须通过 `validate_task.py` 检查（多 case 模式下需遍历全部 groups 通过）
+- 下游 `verify.py` / `benchmark.py` 已内建分支判断（优先 `get_input_groups`、回落 `get_inputs`），无需在任务文件追加兼容层
 
 ### 模式 B：GPU Kernel 输入模式（TritonNPUKernelBench）
 
@@ -128,6 +142,7 @@ mkdir -p {工作目录}/output
    - 若验证失败，最多重试 2 次修复 `Model` 翻译错误
    - 验证通过后进入 Phase 2
 
+验证通过后直接进入 Phase 2。
 ---
 
 ## Phase 2: 算法设计
