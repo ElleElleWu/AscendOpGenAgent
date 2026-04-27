@@ -455,7 +455,19 @@ while opt_round < max_opt_rounds:
 **写入 `{工作目录}/report.md`**：
 - 基本信息：arch、工作目录
 - 生成结果：迭代次数、最终版本来源
-- 性能数据：延时加速比、总延时、平均延迟
+- **Shape 通过率（以 verify 为准）**：`passed_cases / total_cases` 必须从
+  `output/iter_{phase3_last_iter}/verify/verify_result.json` 读取。
+  ⚠️ **禁止**从 `perf_result.json` 取 passed_cases —— 后者是"benchmark exec 成功数"
+  （进程未崩溃即算 pass），与"精度通过数"语义不同；精度错的 kernel 仍可能 benchmark 成功。
+- **GPU 参考性能**（仅在 GPU Kernel 模式下且找到 `gpu_perf_csv` 时显示）：
+  - GPU 参考延迟
+  - Ascend Triton 延迟
+  - Ascend/GPU 倍数
+- 性能数据：**延时加权加速比**（保留 4 位小数）、总延时、平均延迟
+- 性能明细：以 verify_result.json 的逐 shape 结果为基准列出 **status**；通过的 shape 再
+  从 `output/perf_result.json`（Phase 4 成功时从 `optimized_perf_result.json`）的
+  `per_shape_results` 里取该 shape 的 framework / implementation / speedup（保留 4 位小数）；
+  失败 shape 在表格中以 `status=fail` 行展示并附 `error_type`，不填延时。
 - 代码路径：`{op_name}_generated.py`
 
 **写入 `{工作目录}/summary.json`**：
@@ -668,6 +680,18 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | Phase 3 | C 类重复错误 | 立即终止，任务失败 |
 | Phase 4 | 无更多优化点 + 无效果 | 以 Phase 3 结果继续 |
 | Phase 4 | B 类环境错误 | 终止优化，以 Phase 3 结果继续 |
+
+### L1 闸门触发的失败映射
+
+L1 闸门由 benchmark.py 在 Phase 3.5 / 4.3 启动时执行，不通过即 **exit 2** 拒绝运行。
+agent 收到 exit 2 时，必须按下表把它**等价映射**到对应 verify 失败的现有处理路径，
+不得视为脚本崩溃也不得视为成功。
+
+| 触发位置 | 信号 | 等价处理 | 备注 |
+|---------|------|---------|------|
+| Phase 3.5 benchmark exit 2 | stderr 含 `[L1 闸门]` | 等价 3.3 verify 失败 → 读 verify_result.json failures → 3.4 Conductor → iteration++ | log.md 标注 "L1 兜底触发：agent 越过 3.3 闸门" |
+| Phase 4.3 optimized benchmark exit 2 | 同上 | 等价 4.2 optimized 失败 → 读 verify_result_optimized.json failures → 4.5 A 类 → opt_iteration++ | log.md 标注 "L1 兜底触发：agent 越过 4.3 断言" |
+| Phase 4 入口断言失败 | agent 自检 verify_result.json passed<total | **C 类终止任务**，写 `summary.json.failure_phase = "phase3_gate_violation"` | 不允许退回 Phase 3（会无限循环） |
 
 ---
 
