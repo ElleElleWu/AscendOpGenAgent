@@ -58,6 +58,24 @@ export ASCEND_RT_VISIBLE_DEVICES=${npu}
 
 `arch` 和 `npu` 是全局上下文，后续所有 Phase 中调用子 Agent 时都必须传递。
 
+### GPU Kernel 模式自动检测
+
+当用户提供的算子描述文件满足以下任一条件时，进入 **GPU Kernel 输入模式**：
+1. 文件路径包含 `TritonNPUKernelBench`
+2. 文件内容包含 `@triton.jit`（即这是一个 GPU Triton kernel，而非 PyTorch Model）
+3. 用户显式提供了 `gpu_perf_csv` 或 `pt_file` 路径
+
+**路径推导规则**（必须通过 bash 工具探测确认）：
+- `op_name` = 描述文件名去掉 `.py` 后缀
+- `pt_file` 推导：
+  - 若用户显式提供，直接使用
+  - 否则，自动查找描述文件同级目录下的 `{op_name}.pt`
+  - 找不到 → 报错终止
+- `gpu_perf_csv` 推导：
+  - 若用户显式提供，直接使用
+  - 否则，从描述文件所在目录开始**向上级目录递归查找** `vllm_gpu_perf.csv`（最多向上 3 级）
+  - 找不到 → 告警并在报告中注明"未找到 GPU 性能基线"
+
 创建工作目录：
 ```
 ${pwd}/triton_ascend_output/op_{op_index}_{op_name}_{YYYYMMDD_HHMM}_{4位随机数}/
@@ -77,11 +95,38 @@ mkdir -p {工作目录}/output
 
 ## Phase 1: 任务构建
 
+### 模式 A：标准 KernelBench
+
 调用 `op-task-extractor` skill，从用户描述中构建 KernelBench 格式的任务描述文件。
 
 **产出**：`{工作目录}/{op_name}.py`
 
 验证通过后直接进入 Phase 2。
+
+### 模式 B：GPU Kernel 输入模式（TritonNPUKernelBench）
+
+**不调用 `op-task-extractor` skill**，由 Agent 自身执行以下步骤：
+
+1. **读取数据源**
+   - `desc_file`：GPU kernel 源码（用户提供的 `.py`）
+   - `pt_file`：`torch.load()` 后的 dict，包含 `input_data`（必须）和可选的 `gpu_output`
+
+2. **构建 `Model` 类**
+   - **首选方案**：若 `.pt` 中存在 `gpu_output`，构造一个 `Model` 其 `forward()` 直接返回预存的 `gpu_output`
+     - 此时 framework 延迟将直接替换为 GPU 参考延迟，不再额外标注说明
+   - **兜底方案**：若 `.pt` 中不存在 `gpu_output`，则根据 `@triton.jit` kernel 的语义，手写一个等价的纯 PyTorch 参考实现
+     - 若 kernel 逻辑过于复杂无法精确翻译，报错终止并提示用户补充 `gpu_output`
+
+3. **构建输入函数**
+   - `get_inputs()`：按 kernel 参数顺序从 `input_data` 构造列表，返回 `[tensor1, tensor2, scalar1, ...]`
+   - `get_init_inputs()`：返回 `[]`
+   - 常量参数（如 `HEAD_DIM`, `N_ROUNDED`, `IS_BASE_E`）若存在于 `input_data` 中，一并作为 `get_inputs()` 的返回值
+
+4. **验证 task_desc.py**
+   - 保存 `{工作目录}/{op_name}.py`
+   - 使用 `op-task-extractor/scripts/validate_task.py` 进行静态+运行时验证
+   - 若验证失败，最多重试 2 次修复 `Model` 翻译错误
+   - 验证通过后进入 Phase 2
 
 ---
 
@@ -615,6 +660,7 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 
 | 约束 | 说明 |
 |------|------|
+| GPU Kernel 模式 | `.pt` 必须与 `.py` 同名同目录；`vllm_gpu_perf.csv` 向上查找最多 3 级 |
 | ⚠️ **禁止自行执行核心任务** | **代码生成、性能优化、精度验证、性能测试必须通过子 Agent 完成，禁止主 Agent 自行执行。违反此约束将导致任务失败。** |
 | ⚠️ **禁止修改 todo-optim.json** | **只有 kernel-analyzer 子 Agent 有权创建和更新该文件** |
 | Phase 3 最大迭代 | 5 次，禁止超出 |
