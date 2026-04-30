@@ -306,6 +306,15 @@ while iteration < max_iterations:
 
 ⚠️ **Phase 4 是必须执行的阶段，禁止跳过。** Phase 3 验证通过后，无论性能数据如何，都必须进入 Phase 4 尝试优化。
 
+**阶段目标**：性能优化阶段的核心目标是使 Triton 实现达到 **1.0x speedup_vs_torch**（即 Triton 性能追平或超越 PyTorch 基线）。
+
+**进入条件判断**：
+- Phase 3 完成后立即检查 `speedup_vs_torch`
+  - 如果 `speedup_vs_torch >= 1.0` → **跳过 Phase 4**，直接进入 Phase 5
+  - 如果 `speedup_vs_torch < 1.0` → **进入 Phase 4** 进行性能优化
+
+**退出条件**：优化过程中一旦 `speedup_vs_torch >= 1.0`，立即停止优化并进入 Phase 5。
+
 ### 状态变量
 
 ```
@@ -327,7 +336,15 @@ optimization_history = []
 ```
 opt_round = 0
 
-── 4.0 首次分析（必须执行）────────────────────────────────
+── 4.0 进入条件判断（必须执行）─────────────────────────────
+读取 {工作目录}/output/perf_result.json：
+  - 如果 speedup_vs_torch >= 1.0：
+    → 记录"Phase 3 性能已达标，跳过 Phase 4"
+    → 直接进入 Phase 5
+  - 如果 speedup_vs_torch < 1.0：
+    → 继续 4.1（进入性能优化）
+
+── 4.1 首次分析（必须执行）────────────────────────────────
 【强制】调用 kernel-analyzer 子 Agent：
   - 输入：code_file_path, todo_optim_path, optim_history_path, npu, arch
   - kernel-analyzer 单次调用必须完成：
@@ -339,19 +356,19 @@ opt_round = 0
 
 while opt_round < max_opt_rounds:
 
-    ── 4.1 检查优化点 ─────────────────────────────────────
+    ── 4.2 检查优化点 ─────────────────────────────────────
     读取 todo_optim_path：
       - 如果 optimization_points 数组为空 → 跳到 4.9（退出优化）
-      - 如果有优化点 → 继续 4.2
+      - 如果有优化点 → 继续 4.3
 
-    ── 4.2 解析优化点 ─────────────────────────────────────
+    ── 4.3 解析优化点 ─────────────────────────────────────
     从 todo_optim_path 读取优化点列表，取第一个作为本轮目标
 
-    ── 4.3 创建优化轮次目录 ────────────────────────────────
+    ── 4.4 创建优化轮次目录 ────────────────────────────────
     round_dir = {工作目录}/output/opt_round_{opt_round}
     mkdir -p round_dir
 
-    ── 4.4 执行单点优化 ────────────────────────────────────
+    ── 4.5 执行单点优化 ────────────────────────────────────
     调用 kernel-optimizer 子 Agent：
       - input_code_path = best_code
       - optimization_point = 本轮目标优化点
@@ -365,7 +382,7 @@ while opt_round < max_opt_rounds:
       4. 测试优化后代码的性能
       5. 返回优化结果
 
-    ── 4.5 结果判定 ───────────────────────────────────────
+    ── 4.6 结果判定 ───────────────────────────────────────
     if optimization_point == "无优化点":
       → 记录并跳到 4.9
 
@@ -390,7 +407,18 @@ while opt_round < max_opt_rounds:
       → best_code 保持不变
       → optimization_result = {status: "failed", reason: xxx}
 
-    ── 4.6 更新 todo-optim.json（必须执行）────────────────
+    ── 4.7 优化成功后立即检查性能达标 ─────────────────────
+    if 优化成功（验证通过且有性能提升）:
+      → 读取本轮性能结果中的 speedup_vs_torch
+      → 如果 speedup_vs_torch >= 1.0（即 Triton 性能已达到或超过 PyTorch 基线）:
+        → 记录"性能达标，提前退出优化阶段"
+        → 【关键】将本轮最优结果晋升到 output/（如果尚未晋升）
+          1. cp {round_dir}/optimized_code.py → {工作目录}/output/generated_code.py
+          2. 根据 kernel-optimizer 返回的 performance 数据，构造并写入 {工作目录}/output/perf_result.json
+        → 准备 optimization_result 传递给 kernel-analyzer
+        → 直接进入 Phase 5
+
+    ── 4.8 更新 todo-optim.json（必须执行）────────────────
     opt_round++
     【强制】调用 kernel-analyzer 子 Agent：
       - 输入：
@@ -423,7 +451,7 @@ while opt_round < max_opt_rounds:
 
 - **每一轮优化前后都必须调用 kernel-analyzer**
   - 4.0：单次调用 = 分析 + 创建 todo-optim.json
-  - 4.6：单次调用 = 分析 + 更新 todo-optim.json
+  - 4.7：单次调用 = 分析 + 更新 todo-optim.json
 - **禁止跳过 kernel-analyzer 调用**
 - **单次调用内不能拆分分析和写入操作** - 必须一次性完成
 - **验证机制**：每次调用后必须验证 todo-optim.json 被正确创建/更新
@@ -441,16 +469,27 @@ while opt_round < max_opt_rounds:
 
 | 主流程步骤 | 详细流程步骤 | 说明 |
 |-----------|-------------|------|
-| 4.0 | 4.1 | 首次分析 |
-| 4.1 | 4.2 | 检查优化点 |
-| 4.2 | 4.3 | 解析优化点 |
-| 4.3 | 4.4 | 创建优化轮次目录 |
-| 4.4 | 4.5 | 执行单点优化 |
-| 4.5 | 4.6 | 结果判定 |
-| 4.6 | 4.7 | 更新 todo-optim.json |
-| 4.9 | 4.8 | 退出优化阶段 |
+| 4.0 | 4.1 | 进入条件判断 |
+| 4.1 | 4.2 | 首次分析 |
+| 4.2 | 4.3 | 检查优化点 |
+| 4.3 | 4.4 | 解析优化点 |
+| 4.4 | 4.5 | 创建优化轮次目录 |
+| 4.5 | 4.6 | 执行单点优化 |
+| 4.6 | 4.7 | 结果判定 |
+| 4.7 | 4.8 | 性能达标检查 |
+| 4.8 | 4.9 | 更新 todo-optim.json |
+| 4.9 | 4.10 | 退出优化阶段 |
 
-#### 4.1 首次分析（对应 4.0）
+#### 4.1 进入条件判断（对应 4.0）
+
+读取 `{工作目录}/output/perf_result.json`，检查 `speedup_vs_torch`：
+- 如果 `speedup_vs_torch >= 1.0`：
+  → 记录"Phase 3 性能已达标，跳过 Phase 4"
+  → 直接进入 Phase 5
+- 如果 `speedup_vs_torch < 1.0`：
+  → 继续 4.2（进入性能优化）
+
+#### 4.2 首次分析（对应 4.1）
 
 调用 `kernel-analyzer` 子 Agent：
 
@@ -466,13 +505,13 @@ while opt_round < max_opt_rounds:
   - todo-optim.json文件（创建，包含识别出的所有可优化点，按优化潜力排序）
 ```
 
-#### 4.2 检查优化点（对应 4.1）
+#### 4.3 检查优化点（对应 4.2）
 
 读取 `todo_optim_path` 文件内容：
-- 如果 `optimization_points` 数组为空 → 跳到 4.9（退出优化）
-- 如果有优化点 → 继续 4.3
+- 如果 `optimization_points` 数组为空 → 跳到 4.10（退出优化）
+- 如果有优化点 → 继续 4.4
 
-#### 4.3 解析优化点（对应 4.2）
+#### 4.4 解析优化点（对应 4.3）
 
 从 `todo_optim_path` 解析优化点列表，格式示例：
 ```json
@@ -496,7 +535,7 @@ while opt_round < max_opt_rounds:
 
 取数组中第一个优化点作为本轮执行目标。
 
-#### 4.4 创建优化轮次目录（对应 4.3）
+#### 4.5 创建优化轮次目录（对应 4.4）
 
 ```bash
 round_dir={工作目录}/output/opt_round_{opt_round}
@@ -504,7 +543,7 @@ mkdir -p {round_dir}
 mkdir -p {round_dir}/verify
 ```
 
-#### 4.5 执行单点优化（对应 4.4）
+#### 4.6 执行单点优化（对应 4.5）
 
 调用 `kernel-optimizer` 子 Agent：
 
@@ -536,7 +575,7 @@ kernel-optimizer 返回：
 }
 ```
 
-#### 4.6 结果判定（对应 4.5）
+#### 4.7 结果判定（对应 4.6）
 
 ```
 if kernel-optimizer 返回 success == true:
@@ -555,7 +594,19 @@ if kernel-optimizer 返回 success == true:
     - 如果本轮 optimized_latency_ms < output/perf_result.json 中的最优 latency → 将本轮代码和性能结果覆盖更新到 output/
 ```
 
-#### 4.7 更新 todo-optim.json（对应 4.6）
+#### 4.8 性能达标检查（对应 4.7）
+
+【性能达标提前退出条件】如果本轮优化成功：
+  → 读取本轮性能结果中的 speedup_vs_torch
+  → 如果 speedup_vs_torch >= 1.0（即 Triton 性能已达到或超过 PyTorch 基线）:
+    → 记录"性能达标，提前退出优化阶段"
+    → 【关键】将本轮最优结果晋升到 output/（如果尚未晋升）
+      1. cp {round_dir}/optimized_code.py → {工作目录}/output/generated_code.py
+      2. 根据 kernel-optimizer 返回的 performance 数据，构造并写入 {工作目录}/output/perf_result.json
+    → 准备 optimization_result 传递给 kernel-analyzer
+    → 直接进入 Phase 5
+
+#### 4.10 更新 todo-optim.json（对应 4.8）
 
 调用 `kernel-analyzer` 子 Agent：
 ```
@@ -583,7 +634,7 @@ kernel-analyzer 必须完成以下操作：
   - todo-optim.json文件（更新，移除已处理优化点，添加新识别的优化点，按优化潜力排序）
 ```
 
-#### 4.8 退出优化阶段（对应 4.9）
+#### 4.10 退出优化阶段（对应 4.9）
 
 【性能达标退出条件】如果当前 speedup_vs_torch >= 1.0（即 Triton 性能已达到或超过 PyTorch 基线）：
   → 记录性能达标
@@ -628,50 +679,6 @@ else:
       "status": "failed",
       "reason": <失败原因或性能劣化说明>
     }
-```
-
-#### 4.7 更新 todo-optim.json 并继续
-
-```
-opt_round++
-
-调用 kernel-analyzer 子 Agent：
-输入：
-  - npu: NPU设备ID
-  - code_file_path: best_code（最新优化后的代码）
-  - todo_optim_path: todo-optim.json路径
-  - arch: 硬件架构
-  - optimization_result: 本轮优化结果
-    {
-      "optimization_point": <优化点序号和名称>,
-      "status": "success" | "failed",
-      "speedup": <加速比，仅 success 时>,
-      "reason": <失败原因，仅 failed 时>
-    }
-
-kernel-analyzer 职责：
-  1. 根据 optimization_result 移除已完成或失败的优化点
-  2. 重新分析最新代码，识别新的优化机会
-  3. 更新 todo-optim.json
-
-返回 4.2 继续下一轮
-```
-
-#### 4.8 退出优化阶段
-
-从 `optimization_history` 中选择性能最优的结果：
-
-```
-if optimization_history 不为空:
-  找到 optimization_history 中 performance.optimized_latency_ms 最小的记录
-  → best_code = 该记录的 code_path 内容
-  → best_perf = 该记录的 performance
-
-else:
-  → best_code = Phase 3 的 generated_code.py
-  → best_perf = Phase 3 的 perf_result.json
-
-→ 进入 Phase 5
 ```
 
 ### Phase 4 目录结构
