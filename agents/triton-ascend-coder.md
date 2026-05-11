@@ -33,14 +33,14 @@ skills:
 本 Agent 采用 SubAgent 拆分模式执行任务，**禁止主 Agent 自行执行核心任务**，所有代码生成、验证、优化必须通过 SubAgent 完成。
 
 **关键架构变更：**
-- **Phase 3**: kernel-generator 子 Agent **单次调用**，内部跑完整 "生成 → 验证 → 修复" 循环（默认上限 10 轮）。直接 Bash 调 `verify.py` / `benchmark.py`，不再嵌套 kernel-verifier 子 Agent。
+- **Phase 3**: kernel-generator 子 Agent **单次调用**，内部跑完整 "生成 → 验证 → 修复" 循环（默认上限 20 轮）。直接 Bash 调 `verify.py` / `benchmark.py`，不再嵌套 kernel-verifier 子 Agent。
 - **Phase 4**: 主 Agent 编排多轮循环（默认上限 10 轮），每轮顺序调用 kernel-analyzer（刷新 todo-optim.json）+ kernel-optimizer（执行单点优化与验证）。子 Agent 之间不嵌套调用。
 
 ```
 Phase 0: 参数确认
 Phase 1: 任务构建          (op-task-extractor / GPU Kernel 模式由 Agent 自建)
 Phase 2: 算法设计          (kernel-designer)
-Phase 3: 代码生成与验证    (kernel-generator 单次调用，内部 10 轮循环)
+Phase 3: 代码生成与验证    (kernel-generator 单次调用，内部 20 轮循环)
 Phase 4: 性能优化与验证    (主 Agent 编排：kernel-analyzer + kernel-optimizer 多轮交替)
 Phase 5: 输出报告
 Phase 6: 会话导出          (session.jsonl + session.md)
@@ -163,7 +163,7 @@ mkdir -p {工作目录}/output
 
 ## Phase 3: 代码生成与验证（单次调用 kernel-generator）
 
-**架构变更**：Phase 3 完整的迭代循环（生成 → 验证 → 修复）已下沉到 `kernel-generator` 子 Agent 内部。主 Agent 在 Phase 3 中**只 `Agent()` 调用一次**，由 generator 在自身上下文中跑完所有轮次（默认上限 10 轮），通过对话历史天然保留每轮失败信息，避免冷启动重复踩坑。主 Agent 不再编排 iteration / verifier_error / conductor_suggestion 等中间状态。
+**架构变更**：Phase 3 完整的迭代循环（生成 → 验证 → 修复）已下沉到 `kernel-generator` 子 Agent 内部。主 Agent 在 Phase 3 中**只 `Agent()` 调用一次**，由 generator 在自身上下文中跑完所有轮次（默认上限 20 轮），通过对话历史天然保留每轮失败信息，避免冷启动重复踩坑。主 Agent 不再编排 iteration / verifier_error / conductor_suggestion 等中间状态。
 
 ### 调用步骤
 
@@ -190,22 +190,35 @@ Phase 3 入口：
 - verifier_scripts_dir: {仓库内 skills/triton/kernel-verifier/scripts 的绝对路径}
 
 【迭代参数】
-- max_iterations: 10
+- max_iterations: 20
 - warmup: 5
 - repeats: 50
 
 请按你的 SKILL.md / agent.md 流程执行，最终返回 JSON 结果。
 EOF)
+```
 
 generator 返回结果处理：
 
-if success == true:
+⛔ **Phase 3 → Phase 4 闸门（硬性约束）**
+
+只允许在以下条件**全部满足**时进入 Phase 4，任一不满足必须直接跳到 Phase 6（会话导出）：
+
+1. generator 返回的 JSON 中 `success == true`
+2. `{work_dir}/output/iter_{last}/verify/verify_result.json` 的 `passed_cases == total_cases > 0`
+
+任一条件不满足，包括但不限于 `last_error_type` 为 `max_iterations_reached` / `repeated_error` / `env_error` / `missing_input` / `verify_gate_violated`，主 Agent **严禁**调用 kernel-analyzer 或 kernel-optimizer，必须立即按下方失败映射写入 `summary.json` 并跳到 Phase 6。
+
+```
+if success == true and verify 全过:
     读取 {work_dir}/output/perf_result.json，提取 speedup_vs_torch 等指标
     → 进入 Phase 4 判定
 else:
     根据 last_error_type 写 summary.json：
         - "env_error" / "max_iterations_reached" / "repeated_error" → failure_phase = "generation"
         - "missing_input" → failure_phase = "phase3_input_invalid"
+        - "verify_gate_violated" → failure_phase = "phase3_gate_violation"
+    ⛔ 严禁进入 Phase 4
     → 跳到 Phase 6（会话导出）
 ```
 
@@ -223,7 +236,15 @@ else:
 
 ## Phase 4: 性能优化与验证（迭代循环）
 
-⚠️ **Phase 4 是必须执行的阶段，禁止跳过。** Phase 3 验证通过后，无论性能数据如何，都必须进入 Phase 4 尝试优化。
+⚠️ **Phase 4 是 Phase 3 成功后必须执行的阶段，禁止跳过。** Phase 3 验证通过后，无论性能数据如何，都必须进入 Phase 4 尝试优化。
+
+⛔ **Phase 4 入口前置条件（硬性约束）**：必须同时满足以下三条才允许进入 Phase 4，任一不满足必须直接跳到 Phase 6：
+
+1. Phase 3 kernel-generator 返回 `success=true`
+2. `{work_dir}/output/perf_result.json` 真实存在且可解析
+3. `{work_dir}/output/iter_{phase3_last_iter}/verify/verify_result.json` 的 `passed_cases == total_cases > 0`
+
+特别地，当 kernel-generator 在 20 轮内一次都没有 verify 全过（`last_error_type="max_iterations_reached"`）时，主 Agent **严禁**进入 Phase 4，必须直接写入 `summary.json.failure_phase = "generation"` 后跳到 Phase 6。
 
 ### 状态变量
 
@@ -620,7 +641,7 @@ L1 闸门错误的处理：
 | GPU Kernel 模式 | `.pt` 必须与 `.py` 同名同目录；`vllm_gpu_perf.csv` 向上查找最多 3 级 |
 | ⚠️ **禁止自行执行核心任务** | **代码生成、性能优化、精度验证、性能测试必须通过子 Agent 完成，禁止主 Agent 自行执行。违反此约束将导致任务失败。** |
 | ⚠️ **禁止修改 todo-optim.json** | **只有 kernel-analyzer 子 Agent 有权创建和更新该文件** |
-| Phase 3 最大迭代 | 10 次（在 kernel-generator 内部强制） |
+| Phase 3 最大迭代 | 20 次（在 kernel-generator 内部强制） |
 | Phase 4 最大轮次 | 10 轮（主 Agent 强制） |
 | Phase 4 连续失败上限 | 3 次（主 Agent 强制） |
 | 优化点选择 | 每轮只选择一个优化点执行 |
@@ -628,6 +649,8 @@ L1 闸门错误的处理：
 | 文件操作范围 | 限制在工作目录内 |
 | 语言 | 思考、分析、日志使用中文；代码、路径使用英文 |
 | 时间戳/随机数 | 必须通过 bash 获取，禁止 LLM 模拟 |
+| ⚠️ **Phase 3 失败禁止 Phase 4** | kernel-generator 返回 `success=false`（含 `max_iterations_reached` / `repeated_error` / `env_error` / `missing_input` / `verify_gate_violated`）时，主 Agent **必须**直接跳到 Phase 6，**严禁**调用 kernel-analyzer / kernel-optimizer |
+| ⚠️ **verify 未全过禁止 benchmark** | 任何 iter 目录下 `verify_result.json` 显示 `passed_cases < total_cases` 时，**严禁**调用 `benchmark.py`。该规则在脚本层（`benchmark.py` L1 闸门 exit 2）和 Agent 层（kernel-generator / kernel-optimizer 内）双重强制 |
 
 ---
 

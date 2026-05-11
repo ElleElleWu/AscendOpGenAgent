@@ -42,6 +42,7 @@ skills:
 - **禁止**自行编写 Python 测试代码或使用 `torch.allclose` 替代 `verify.py`
 - **禁止**跳过 `verify.py` 直接判定验证结果
 - **禁止**在迭代循环中越过 `max_iterations` 上限
+- ⛔ **严禁在 verify 未全过时调用 `benchmark.py`**：`verify_result.json` 中只要 `passed_cases < total_cases`、文件不存在、或解析失败，本轮一律按"验证失败"处理，直接进入下一轮迭代或终止。**绝对不允许**以"想看看性能"、"先跑 benchmark 排查"等任何理由提前调用 `benchmark.py`。该规则在脚本层（`benchmark.py` 的 L1 闸门 exit 2）和 Agent 层（本约束）双重强制，违反即任务失败。
 
 ---
 
@@ -61,7 +62,7 @@ skills:
 
 - `sketch`：算法草图（Phase 2 产出，传给 skill 辅助生成）
 - `user_requirements`：用户附加要求
-- `max_iterations`：最大迭代轮次，默认 `10`
+- `max_iterations`：最大迭代轮次，默认 `20`
 - `warmup`：benchmark warmup 次数，默认 `5`
 - `repeats`：benchmark 重复次数，默认 `50`
 
@@ -136,6 +137,15 @@ while iteration < max_iterations:
 
     读取 {verify_dir}/verify_result.json：
         passed_cases / total_cases / failures
+
+    ── 2.3.5 verify 闸门（硬性约束）─────────────
+    ⛔ 必须先按下表判定，再决定是否进入 2.5 性能测试：
+        - verify_result.json 不存在 / 无法解析 / total_cases == 0
+              → 视为验证失败，跳到 2.4，**严禁**调用 benchmark.py
+        - passed_cases <  total_cases
+              → 视为验证失败，跳到 2.4，**严禁**调用 benchmark.py
+        - passed_cases == total_cases > 0
+              → 才进入 2.5 性能测试
 
     if passed_cases == total_cases（全部通过）:
         ── 2.5 性能测试 ───────────────────────
@@ -245,3 +255,4 @@ if iteration >= max_iterations:
 - 不要运行除 `verify.py` / `benchmark.py` 之外的额外测试代码
 - 不要输出长篇解释，简短返回结果即可
 - 不要在循环中向主 Agent 报告中间状态
+- ⛔ **闸门自检**：返回 success 前，必须确认 `{work_dir}/output/perf_result.json` 对应的 iter 目录下 `verify/verify_result.json` 的 `passed_cases == total_cases`。若发现任一 iter 目录中 `verify_result.json` 精度未全过但同目录存在 `perf_result.json`，视为本 Agent 违规，必须立即返回 failure（`failure_reason="verify_gate_violated"`、`last_error_type="env_error"`）。
