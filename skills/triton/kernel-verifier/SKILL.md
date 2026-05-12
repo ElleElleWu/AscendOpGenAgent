@@ -327,66 +327,71 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 
 ## 精度阈值说明
 
-验证使用基于数据类型的 **MERE/MARE 相对误差 + 小值域绝对误差** 双轨判定（NPU Benchmark 标准）。
+验证采用基于数据类型的 **元素级分类 matched + 三项整体判定**（NPU Benchmark 标准）。
 
-### 常规精度标准（正常值域）
+### 元素级 matched 定义（分类）
 
-对 `|golden| >= small_value_threshold` 的元素计算相对误差：
+对每个 finite 元素 `i`，按 `|golden[i]|` 落入的类别分别判定：
 
-```
-MERE < threshold        且        MARE < 10 × threshold
-```
+- **小值域** `|golden[i]| < small_value_threshold`：
+  `matched[i] = (|actual[i] - golden[i]| <= small_value_error)`
+- **正常域** `|golden[i]| >= small_value_threshold`：
+  `matched[i] = (|actual[i] - golden[i]| / (|golden[i]| + 1e-7) <= rel_threshold)`
 
-其中：
-- `MERE` = mean(|actual - golden| / (|golden| + 1e-7))，平均相对误差
-- `MARE` = max(|actual - golden| / (|golden| + 1e-7))，最大相对误差
-- 计算前两侧统一升 float32，避免低精度 dtype 自身误差污染
-- 分母用 `|golden| + 1e-7` 防止除零
+> 计算前两侧统一升 float32，避免低精度 dtype 自身误差污染。
+> 分母 `+1e-7` 仅为保险——正常域里 `|golden| >= small_value_threshold ≫ 1e-7`。
 
-### 小值域标准（极小值）
+### 通过条件（三项 AND，全部满足才算通过）
 
-当 golden 接近 0 时，相对误差计算不稳定，因此采用绝对误差判定：
-
-```
-ErrorCount = sum(I(|golden| < small_value_threshold 且  |actual - golden| > small_value_error))
-通过条件：ErrorCount <= 2
-```
-
-### 三种场景的分支判定
-
-根据 golden 值的分布，分为三种场景：
-
-| 场景 | 判定条件 | 检查标准 |
-|------|---------|---------|
-| **全部在小值域** | 所有 `\|golden\| < small_value_threshold` | 仅检查小值域标准 |
-| **全部在正常值域** | 所有 `\|golden\| >= small_value_threshold` | 仅检查常规精度标准（MERE/MARE） |
-| **混合情况** | 同时存在小值和正常值 | 将输出**分割**成两个子集分别评估：小值子集检查小值域标准，正常子集检查常规精度标准，两部分都通过才算整体通过 |
+1. **`max_error_cap`**：`max(|actual - golden|) <= 0.1`（全局绝对误差上限，dtype 无关）
+2. **`required_matched_ratio`**：`sum(matched) / total_finite >= 0.98`
+3. **`MERE`**：对**所有 finite 元素**计算 `rel_err = |diff| / (|golden| + 1e-7)` 再取均值，要求 `MERE < rel_threshold`。当 `total_finite == 0` 时本项自动通过。
 
 ### 阈值表
 
-**常规精度阈值**（用于相对误差判定）：
+| 数据类型 | small_value_threshold | small_value_error | rel_threshold (= MERE 上限) |
+|---|---|---|---|
+| `float16` | 2⁻¹¹ ≈ 4.88e-4 | 2⁻¹⁶ ≈ 1.53e-5 | 2⁻¹⁰ ≈ 9.77e-4 |
+| `bfloat16` | 2⁻⁸ ≈ 3.91e-3 | 2⁻¹⁶ ≈ 1.53e-5 | 2⁻⁷ ≈ 7.81e-3 |
+| `float32` | 2⁻¹⁴ ≈ 6.10e-5 | 2⁻³⁰ ≈ 9.31e-10 | 2⁻¹³ ≈ 1.22e-4 |
+| `hifloat32` | 2⁻¹² ≈ 2.44e-4 | 2⁻²⁸ ≈ 3.73e-9 | 2⁻¹¹ ≈ 4.88e-4 |
+| `float8_e4m3` | 2⁻⁴ = 0.0625 | 2⁻⁶ ≈ 0.015625 | 2⁻³ = 0.125 |
+| `float8_e5m2` | 2⁻³ = 0.125 | 2⁻⁵ = 0.03125 | 2⁻² = 0.25 |
+| 其他 dtype（fallback） | 2⁻¹⁴ | 2⁻³⁰ | 2⁻¹³ |
 
-| 数据类型 | threshold | MERE 上限 | MARE 上限 (10×t) |
-|---------|-----------|-----------|------------------|
-| `float16` | 2⁻¹⁰ ≈ 9.77e-4 | 9.77e-4 | 9.77e-3 |
-| `bfloat16` | 2⁻⁷ ≈ 7.81e-3 | 7.81e-3 | 7.81e-2 |
-| `float32` | 2⁻¹³ ≈ 1.22e-4 | 1.22e-4 | 1.22e-3 |
-| `hifloat32` | 2⁻¹¹ ≈ 4.88e-4 | 4.88e-4 | 4.88e-3 |
-| `float8_e4m3` | 2⁻³ = 0.125 | 0.125 | 1.25 |
-| `float8_e5m2` | 2⁻² = 0.25 | 0.25 | 2.5 |
-| 其他 dtype（fallback） | 2⁻¹³ | 1.22e-4 | 1.22e-3 |
+### 失败时的 JSON 输出
 
-**小值域阈值表**：
+`failures[*]` 在精度不达标时会带上结构化 `metrics`：
 
-| 数据类型 | small_value_threshold | small_value_error |
-|---------|----------------------|-------------------|
-| `float16` | 2⁻¹¹ ≈ 4.88e-4 | 2⁻¹⁶ ≈ 1.53e-5 |
-| `bfloat16` | 2⁻⁸ ≈ 3.91e-3 | 2⁻¹⁶ ≈ 1.53e-5 |
-| `float32` | 2⁻¹⁴ ≈ 6.10e-5 | 2⁻³⁰ ≈ 9.31e-10 |
-| `hifloat32` | 2⁻¹² ≈ 2.44e-4 | 2⁻²⁸ ≈ 3.73e-9 |
-| `float8_e4m3` | 2⁻⁴ = 0.0625 | 2⁻⁶ = 0.015625 |
-| `float8_e5m2` | 2⁻³ = 0.125 | 2⁻⁵ = 0.03125 |
-| 其他 dtype（fallback） | 2⁻¹⁴ | 2⁻³⁰ |
+```json
+{
+  "case_idx": 1,
+  "input_desc": [...],
+  "error_type": "AccuracyError",
+  "error_msg": "...",
+  "metrics": {
+    "matched_ratio": 0.95,
+    "max_abs_diff": 0.2,
+    "MERE": 2.0e-4,
+    "rel_threshold": 1.22e-4,
+    "small_value_threshold": 6.10e-5,
+    "small_value_error": 9.31e-10,
+    "max_error_cap": 0.1,
+    "required_matched_ratio": 0.98,
+    "total_finite": 1000,
+    "matched_count": 950,
+    "small_count": 0,
+    "normal_count": 1000,
+    "checks": {
+      "max_error_cap": false,
+      "required_matched_ratio": false,
+      "MERE": false
+    }
+  }
+}
+```
+
+`checks` 三个布尔位标记每项判定是否独立通过，下游可直接据此分类失败原因（绝对误差爆点 / 离群点过多 / 平均误差偏大）。
 
 ### 比对前置检查（按顺序，任一失败即判 fail）
 

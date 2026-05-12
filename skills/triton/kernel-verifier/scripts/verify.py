@@ -18,6 +18,18 @@ import traceback
 
 ERROR_MSG_LIMIT = 2000
 
+# 精度判定常量（dtype 无关）
+MAX_ERROR_CAP = 0.1
+REQUIRED_MATCHED_RATIO = 0.98
+
+
+class AccuracyError(AssertionError):
+    """精度判定失败异常，附带结构化 metrics 便于下游统计。"""
+
+    def __init__(self, message, metrics):
+        super().__init__(message)
+        self.metrics = metrics
+
 
 def truncate_error(msg: str, limit: int = ERROR_MSG_LIMIT) -> str:
     if msg is None:
@@ -61,60 +73,58 @@ def cleanup_npu_memory():
     gc.collect()
 
 
-def get_limit(data_type):
-    """根据数据类型获取精度阈值 - 使用 2 的幂次方阈值（与 NPU Benchmark 标准一致）
+def get_limits(data_type):
+    """根据数据类型返回精度判定的三元组 (small_value_threshold, small_value_error, rel_threshold)。
 
-    参考文档: 精度对比方法.md
-    数据类型: FLOAT16, BFLOAT16, FLOAT32, HiFloat32, FLOAT8 E4M3, FLOAT8 E5M2
-    判定标准: MERE < threshold 且 MARE < 10 * threshold
+    参考 NPU Benchmark 精度对比方法：
+    - small_value_threshold：判定元素是否落在"小值域"的阈值
+    - small_value_error：小值域元素的绝对误差上限
+    - rel_threshold：正常值域元素的相对误差上限，同时也是 MERE 的判定阈值
 
-    阈值表:
-    | 数据类型      | 阈值 (2^n)      | 十进制值       |
-    |--------------|----------------|---------------|
-    | FLOAT16      | 2^{-10}        | 0.0009765625  |
-    | BFLOAT16     | 2^{-7}         | 0.0078125     |
-    | FLOAT32      | 2^{-13}        | 0.0001220703  |
-    | HiFloat32    | 2^{-11}        | 0.0004882812  |
-    | FLOAT8 E4M3  | 2^{-3}         | 0.125         |
-    | FLOAT8 E5M2  | 2^{-2}         | 0.25          |
+    阈值表：
+    | 数据类型      | small_value_threshold | small_value_error | rel_threshold |
+    |--------------|-----------------------|-------------------|---------------|
+    | FLOAT16      | 2^{-11}               | 2^{-16}           | 2^{-10}       |
+    | BFLOAT16     | 2^{-8}                | 2^{-16}           | 2^{-7}        |
+    | FLOAT32      | 2^{-14}               | 2^{-30}           | 2^{-13}       |
+    | HiFloat32    | 2^{-12}               | 2^{-28}           | 2^{-11}       |
+    | FLOAT8 E4M3  | 2^{-4}                | 2^{-6}            | 2^{-3}        |
+    | FLOAT8 E5M2  | 2^{-3}                | 2^{-5}            | 2^{-2}        |
 
     由于 torch.dtype 中没有直接定义 HiFloat32，可通过字符串传入 "hifloat32" 获取对应阈值。
     """  # noqa: E501
     import torch
 
-    # 支持字符串类型（用于 HiFloat32 或其他自定义类型）
+    # 字符串映射（用于 HiFloat32 或其他自定义类型）
+    str_to_limits = {
+        "float16":     (2**(-11), 2**(-16), 2**(-10)),
+        "bfloat16":    (2**(-8),  2**(-16), 2**(-7)),
+        "float32":     (2**(-14), 2**(-30), 2**(-13)),
+        "hifloat32":   (2**(-12), 2**(-28), 2**(-11)),
+        "float8_e4m3": (2**(-4),  2**(-6),  2**(-3)),
+        "float8_e5m2": (2**(-3),  2**(-5),  2**(-2)),
+        "fp8_e4m3":    (2**(-4),  2**(-6),  2**(-3)),
+        "fp8_e5m2":    (2**(-3),  2**(-5),  2**(-2)),
+    }
     if isinstance(data_type, str):
-        str_to_threshold = {
-            "float16": 2**(-10),
-            "bfloat16": 2**(-7),
-            "float32": 2**(-13),
-            "hifloat32": 2**(-11),
-            "float8_e4m3": 2**(-3),
-            "float8_e5m2": 2**(-2),
-            "fp8_e4m3": 2**(-3),
-            "fp8_e5m2": 2**(-2),
-        }
-        return str_to_threshold.get(data_type.lower(), 2**(-13))
+        return str_to_limits.get(data_type.lower(), (2**(-14), 2**(-30), 2**(-13)))
 
-    # torch.dtype 类型映射
-    dtype_threshold_map = {
-        torch.float16: 2**(-10),    # FLOAT16
-        torch.bfloat16: 2**(-7),    # BFLOAT16
-        torch.float32: 2**(-13),    # FLOAT32
+    # torch.dtype 映射
+    dtype_limits_map = {
+        torch.float16:  (2**(-11), 2**(-16), 2**(-10)),
+        torch.bfloat16: (2**(-8),  2**(-16), 2**(-7)),
+        torch.float32:  (2**(-14), 2**(-30), 2**(-13)),
     }
 
-    # 安全获取 FP8 类型（PyTorch 2.0+ 支持）
-    # FLOAT8 E4M3: 2^{-3}
     float8_e4m3 = getattr(torch, 'float8_e4m3fn', None) or getattr(torch, 'float8_e4m3', None)
     if float8_e4m3 is not None:
-        dtype_threshold_map[float8_e4m3] = 2**(-3)
+        dtype_limits_map[float8_e4m3] = (2**(-4), 2**(-6), 2**(-3))
 
-    # FLOAT8 E5M2: 2^{-2}
     float8_e5m2 = getattr(torch, 'float8_e5m2fn', None) or getattr(torch, 'float8_e5m2', None)
     if float8_e5m2 is not None:
-        dtype_threshold_map[float8_e5m2] = 2**(-2)
+        dtype_limits_map[float8_e5m2] = (2**(-3), 2**(-5), 2**(-2))
 
-    return dtype_threshold_map.get(data_type, 2**(-13))
+    return dtype_limits_map.get(data_type, (2**(-14), 2**(-30), 2**(-13)))
 
 
 def resolve_input_provider(torch_module):
@@ -195,63 +205,118 @@ def compare(fw_out, impl_out, data_type):
 
 
 def _check_accuracy_npu_benchmark(golden, actual, data_type):
-    """执行 NPU Benchmark 精度验证。
+    """执行 NPU Benchmark 精度验证（分类 + 三项判定）。
 
-    根据精度对比方法文档，验证两个张量的数值一致性：
-    - 计算 MERE（平均相对误差）和 MARE（最大相对误差）
-    - 使用 2 的幂次方作为阈值
-    - 判定标准：MERE < threshold 且 MARE < 10 * threshold
+    元素级 matched 定义：
+    - |golden| < small_value_threshold（小值域）：|diff| <= small_value_error
+    - 否则（正常值域）：|diff| / (|golden| + 1e-7) <= rel_threshold
+
+    通过条件（三项 AND）：
+    1. max(|diff|) <= MAX_ERROR_CAP（0.1，dtype 无关的绝对误差上限）
+    2. matched_ratio = sum(matched) / total_finite >= REQUIRED_MATCHED_RATIO（0.98）
+    3. MERE < rel_threshold（对所有 finite 元素计算相对误差再取均值，
+       分母统一用 |golden| + 1e-7 防除零）
 
     Args:
         golden: 参考输出（金标准）
         actual: 被测实现输出
-        data_type: 数据类型，用于获取对应的阈值
+        data_type: 数据类型，用于获取对应的阈值三元组
 
     Raises:
-        AssertionError: 当精度验证未通过时
+        AccuracyError: 当精度验证未通过时，异常的 metrics 属性携带结构化指标
     """
     import torch
 
-    # 统一转换为 float32 进行计算
+    # 统一升 float32，避免低精度 dtype 自身误差污染计算
     golden_f = golden.float()
     actual_f = actual.float()
 
-    # 先取 dtype 阈值，用作分母下界 clamp。
-    # 当 |y_ref| < threshold 时，按 |diff| / threshold 衡量，等价于
-    # "参考值已小到 dtype 精度极限时，改用绝对误差归一化"，避免零值/极小值附近误报。
-    threshold = get_limit(data_type)
+    sv_thr, sv_err, rel_thr = get_limits(data_type)
 
-    diff = (actual_f - golden_f).abs()
-    denom = golden_f.abs().clamp(min=threshold)
-    relative_error = diff / denom
+    abs_diff = (actual_f - golden_f).abs()
+    abs_golden = golden_f.abs()
 
-    # 计算误差指标
-    MERE = relative_error.mean().item()  # 平均相对误差
-    MARE = relative_error.max().item()   # 最大相对误差
+    # 分桶
+    small_mask = abs_golden < sv_thr
+    normal_mask = ~small_mask
 
-    # 判定标准：MERE < t 且 MARE < 10t
-    is_pass = (MERE < threshold) and (MARE < 10 * threshold)
+    # 元素级 matched
+    small_ok = abs_diff <= sv_err
+    rel_err = abs_diff / (abs_golden + 1e-7)
+    normal_ok = rel_err <= rel_thr
+    matched_mask = torch.where(small_mask, small_ok, normal_ok)
 
-    if not is_pass:
-        # 收集错误信息
-        mismatch_mask = relative_error > threshold
-        mismatch_indices = torch.where(mismatch_mask)[0]
-        num_to_show = min(10, len(mismatch_indices))
+    total_finite = matched_mask.numel()
+    matched_count = int(matched_mask.sum().item())
+    matched_ratio = matched_count / total_finite if total_finite > 0 else 1.0
+    max_abs_diff = abs_diff.max().item() if total_finite > 0 else 0.0
 
-        error_msg = (
-            f"验证失败，输出不一致: MERE={MERE:.6e}, MARE={MARE:.6e}, "
-            f"dtype={data_type}, threshold={threshold}\n"
-        )
-        if len(mismatch_indices) > 0:
-            error_msg += f"前 {num_to_show} 个超出阈值的值:\n"
-            for i in range(num_to_show):
-                idx = mismatch_indices[i].item()
+    # MERE：对所有 finite 元素计算相对误差再取均值（分母统一 |golden| + 1e-7 防除零）
+    normal_count = int(normal_mask.sum().item())
+    if total_finite > 0:
+        MERE = rel_err.mean().item()
+        mere_ok = MERE < rel_thr
+    else:
+        MERE = None
+        mere_ok = True
+
+    cap_ok = max_abs_diff <= MAX_ERROR_CAP
+    ratio_ok = matched_ratio >= REQUIRED_MATCHED_RATIO
+    is_pass = cap_ok and ratio_ok and mere_ok
+
+    if is_pass:
+        return
+
+    metrics = {
+        "matched_ratio": matched_ratio,
+        "max_abs_diff": max_abs_diff,
+        "MERE": MERE,
+        "rel_threshold": rel_thr,
+        "small_value_threshold": sv_thr,
+        "small_value_error": sv_err,
+        "max_error_cap": MAX_ERROR_CAP,
+        "required_matched_ratio": REQUIRED_MATCHED_RATIO,
+        "total_finite": total_finite,
+        "matched_count": matched_count,
+        "small_count": int(small_mask.sum().item()),
+        "normal_count": normal_count,
+        "checks": {
+            "max_error_cap": cap_ok,
+            "required_matched_ratio": ratio_ok,
+            "MERE": mere_ok,
+        },
+    }
+
+    # 失败摘要 + 前 N 个 unmatched 位置（按所属桶注明判定标准）
+    unmatched_mask = ~matched_mask
+    unmatched_indices = torch.where(unmatched_mask)[0]
+    num_to_show = min(10, len(unmatched_indices))
+
+    mere_str = f"{MERE:.6e}" if MERE is not None else "n/a"
+    error_msg = (
+        f"验证失败 dtype={data_type}: "
+        f"max_abs_diff={max_abs_diff:.6e} (cap={MAX_ERROR_CAP}, ok={cap_ok}), "
+        f"matched_ratio={matched_ratio:.6f} (req>={REQUIRED_MATCHED_RATIO}, ok={ratio_ok}), "
+        f"MERE={mere_str} (rel_thr={rel_thr:.6e}, ok={mere_ok}); "
+        f"small_count={metrics['small_count']}, normal_count={normal_count}\n"
+    )
+    if num_to_show > 0:
+        error_msg += f"前 {num_to_show} 个未通过的位置:\n"
+        for i in range(num_to_show):
+            idx = unmatched_indices[i].item()
+            if small_mask[idx].item():
                 error_msg += (
-                    f"  位置[{idx}]: framework={golden[idx]:.6e}, "
-                    f"impl={actual[idx]:.6e}, "
-                    f"相对误差={relative_error[idx]:.6e}\n"
+                    f"  位置[{idx}] (小值域): framework={golden[idx]:.6e}, "
+                    f"impl={actual[idx]:.6e}, |diff|={abs_diff[idx]:.6e} "
+                    f"(允许<={sv_err:.6e})\n"
                 )
-        raise AssertionError(error_msg)
+            else:
+                error_msg += (
+                    f"  位置[{idx}] (正常域): framework={golden[idx]:.6e}, "
+                    f"impl={actual[idx]:.6e}, 相对误差={rel_err[idx]:.6e} "
+                    f"(允许<={rel_thr:.6e})\n"
+                )
+    raise AccuracyError(error_msg, metrics)
 
 
 def run_single_case(
@@ -301,6 +366,10 @@ def run_single_case(
             try:
                 data_type = fw_out.dtype
                 compare(fw_out, impl_out, data_type)
+            except AccuracyError as e:
+                raise AccuracyError(
+                    f"[用例 {case_idx}/{total_cases}] {str(e)}", e.metrics
+                ) from e
             except AssertionError as e:
                 raise AssertionError(f"[用例 {case_idx}/{total_cases}] {str(e)}") from e
 
@@ -357,12 +426,15 @@ def verify_implementations(op_name, verify_dir, triton_impl_name="triton_ascend_
         except Exception as e:
             err_detail = traceback.format_exc()
             print(f"  [用例 {case_idx}/{total_cases}] 失败: {type(e).__name__}: {e}", file=sys.stderr)
-            failures.append({
+            failure_entry = {
                 "case_idx": case_idx,
                 "input_desc": input_desc,
                 "error_type": type(e).__name__,
                 "error_msg": truncate_error(err_detail),
-            })
+            }
+            if isinstance(e, AccuracyError):
+                failure_entry["metrics"] = e.metrics
+            failures.append(failure_entry)
         finally:
             del framework_model
             del impl_model
