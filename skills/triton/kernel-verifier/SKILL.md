@@ -16,6 +16,61 @@ argument-hint: >
 你是一个内核代码验证专家。你的任务是按照标准验证流程，创建验证项目并运行，检查生成的算子代码是否能正确编译运行且与参考实现的输出一致。验证通过后，执行性能测试并收集性能数据。
 </role>
 
+## 验证分类与判定标准（概览）
+
+verify.py 按"`--non-compute` 开关 + 输入 dtype + 输出 dtype"分流到 **5 类判定路径**，详尽阈值表见文末"精度阈值说明"。
+
+### 输入类型推断
+
+从实际传入对象推断（KernelBench / NPUKernelBench 通用）：
+
+1. 存在 `torch.Tensor` 输入 → 取所有 tensor 中**最高精度 dtype**（fp64 > fp32 > fp16 > bf16 > fp8 > int64 > int32 > int16 > int8/uint8 > bool）
+2. 否则存在 `list/tuple of Tensor`（tensor_list）→ 取首个 tensor_list 首元素 dtype
+3. 否则视为**无 tensor 输入**（最严路径）
+
+输入 dtype 落到浮点（含 fp8/复数）→ `input_type=float`；落到整型（含 bool）→ `input_type=int`。
+
+### 五类判定决策矩阵
+
+| 类别 | 输入 type | 输出 dtype | `--non-compute` | 误差要求 |
+|---|---|---|---|---|
+| **非计算类** | 任意 | 任意 | **是** | 二进制完全一致（view-as-int 比对，含 NaN bit pattern） |
+| **bool 输出）** | 任意 | bool | 否 | `torch.equal` 严格相等 |
+| **整数计算类** | int / no_tensor | int | 否 | `\|actual − golden\| == 0` |
+| **量化计算类 fp→int** | float | int | 否 | `\|actual − golden\| <= 1` |
+| **浮点计算类** | 任意 | float | 否 | 三项 AND（见下） |
+
+### 浮点计算类：三项整体判定（AND）
+
+1. **max_error_cap**：所有 finite 元素满足 `|diff| <= atol + rtol·|golden|`（dtype-aware，100% 通过）
+2. **matched_ratio ≥ 0.9**：元素级匹配，小值域 `|golden|<sv_thr` 用绝对误差 `|diff|<=sv_err`，正常域用相对误差 `rel_err<=rel_thr`
+3. **MERE < rel_threshold**：所有 finite 元素 `rel_err = |diff|/(|golden|+1e-7)` 的均值
+
+**dtype-aware 阈值速查**（详表见文末）：
+
+| dtype | atol | rtol | sv_thr | sv_err | rel_thr |
+|---|---|---|---|---|---|
+| float32 | 2e-4 | 2⁻¹³ ≈ 1.22e-4 | 2⁻¹⁴ ≈ 6.10e-5 | 2⁻³⁰ ≈ 9.31e-10 | 2⁻¹³ ≈ 1.22e-4 |
+| float16 | 1e-2 | 2⁻¹⁰ ≈ 9.77e-4 | 2⁻¹¹ ≈ 4.88e-4 | 2⁻¹⁶ ≈ 1.53e-5 | 2⁻¹⁰ ≈ 9.77e-4 |
+| bfloat16 | 1e-2 | 2⁻⁷ ≈ 7.81e-3 | 2⁻⁸ ≈ 3.91e-3 | 2⁻¹⁶ ≈ 1.53e-5 | 2⁻⁷ ≈ 7.81e-3 |
+
+### 比对前置检查（任一失败即 fail，先于上述判定）
+
+1. 形状一致
+2. NaN mask 完全一致
+3. Inf 位置 + 符号完全一致
+4. 仅在 `finite_mask`（双方都 finite）上做后续判定；dtype 不一致时 impl 会被 cast 到 golden dtype
+
+### 运行时诊断
+
+verify.py 在每个 case 会向 stderr 打印：
+- `[输入类型判定] 来源=...，候选 dtypes=...，最高精度=...，input_type=...`
+- `[评测模式] 模式=...，输入 dtype=...，输出 dtype=...，误差要求=...`
+
+便于上游 agent 立即看到当前 case 落入了哪一类、用了哪些阈值。
+
+---
+
 ## 验证流程
 
 ```
@@ -124,13 +179,16 @@ python3 /path/to/kernel-verifier/scripts/verify.py \
 | `--verify_dir` | 否 | 验证目录路径，默认当前目录 |
 | `--triton_impl_name` | 否 | Triton 实现模块名（不含 `{op_name}_` 前缀），默认 `triton_ascend_impl` |
 | `--timeout` | 否 | 超时秒数，默认 900 |
+| `--non-compute` | 否 | 适用于非计算类算子（不做数值运算、只对张量进行形状变换、维度重排、切分拼接、索引、类型转换等数据重组操作的算子，常见如 Reshape、Transpose、Concat、Split、Gather、Cast、Pad 等），强制走二进制完全一致判定 |
 
 **超时设置**：默认 900 秒，复杂算子可适当增加。
 
-**⛔ 禁止事项**：
+**注意事项**：
 - 禁止自己编写 Python 代码来测试算子（如手动 import 并 forward 比较）
 - 禁止使用 `torch.allclose` 或其他自创方法替代 `scripts/verify.py`
 - 禁止跳过此步骤直接报告验证结果
+- 禁止对计算类算子（含数值运算）传 `--non-compute`；该开关仅适用于不做数值运算、只做形状变换 / 维度重排 / 切分拼接 / 索引 / 类型转换等数据重组操作的算子（如 Reshape、Transpose、Concat、Split、Gather、Cast、Pad）。误用会强制走二进制完全一致判定，把正常的浮点舍入差异判为失败
+- 对非计算类算子（例如形状变换、维度重排、切分拼接、索引、类型转换等数据重组操作的算子）**一定要**传 `--non-compute`；漏传会让此类算子按浮点三项判定走，容许超出预期的差异，无法识别真正的位级不一致
 
 ---
 
@@ -327,7 +385,45 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 
 ## 精度阈值说明
 
-验证采用基于数据类型的 **元素级分类 matched + 三项整体判定**（NPU Benchmark 标准）。
+验证按"输入类型 + 输出 dtype + --non-compute 开关"分流到四类判定路径。
+
+### 输入类型判定（KernelBench / NPUKernelBench 统一推断）
+
+从实际传入的 Python 对象推断（不依赖 task 文件结构化 spec）：
+
+1. 若 `inputs` 中存在 `torch.Tensor`：取所有 tensor 中**最高精度 dtype**作为输入类型
+2. 否则若存在 `list/tuple of Tensor`（tensor_list）：取首个 tensor_list 的首元素 dtype
+3. 否则视为**无 tensor 输入**，触发"最严格"路径
+
+**dtype 优先级表**（值越大精度越高）：
+
+| dtype | rank |
+|-------|------|
+| float64 | 100 |
+| float32 | 90 |
+| float16 | 80 |
+| bfloat16 | 70 |
+| float8_e4m3 / float8_e5m2 | 60 |
+| int64 | 50 |
+| int32 | 40 |
+| int16 | 30 |
+| int8 / uint8 | 20 |
+| bool | 10 |
+
+输入 dtype 落到浮点（含 fp8/complex）→ 标记为 `float`；落到整型（含 bool）→ 标记为 `int`。
+
+### 算子四分类（决策矩阵）
+
+| --non-compute | 输出 dtype | 输入类型 | 类别 | 判定 |
+|---|---|---|---|---|
+| 是 | 任意 | 任意 | **非计算类** | 二进制完全一致（view-as-int 比对，含 NaN bit pattern）|
+| 否 | bool | 任意 | **bool 输出** | `torch.equal` 严格相等 |
+| 否 | int | int | **整数计算类** | `|diff| == 0` |
+| 否 | int | float | **量化计算类** | `|diff| <= 1` |
+| 否 | int | no_tensor | 整数计算类（最严）| `|diff| == 0` |
+| 否 | float | 任意 | **浮点计算类** | 三项判定（按输出 dtype 阈值）|
+
+### 浮点计算类：三项整体判定（NPU Benchmark 标准）
 
 ### 元素级 matched 定义（分类）
 
@@ -349,6 +445,8 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 
 ### 阈值表
 
+**matched_mask 与 MERE 阈值**（沿用 NPU Benchmark 标准）：
+
 | 数据类型 | small_value_threshold | small_value_error | rel_threshold (= MERE 上限) |
 |---|---|---|---|
 | `float16` | 2⁻¹¹ ≈ 4.88e-4 | 2⁻¹⁶ ≈ 1.53e-5 | 2⁻¹⁰ ≈ 9.77e-4 |
@@ -358,6 +456,15 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 | `float8_e4m3` | 2⁻⁴ = 0.0625 | 2⁻⁶ ≈ 0.015625 | 2⁻³ = 0.125 |
 | `float8_e5m2` | 2⁻³ = 0.125 | 2⁻⁵ = 0.03125 | 2⁻² = 0.25 |
 | 其他 dtype（fallback） | 2⁻¹⁴ | 2⁻³⁰ | 2⁻¹³ |
+
+**max_error_cap 阈值**（`|diff| <= atol + rtol * |golden|`）：
+
+| 数据类型 | atol | rtol |
+|---|---|---|
+| `float16` | 5e-3 | 2⁻¹⁰ ≈ 9.77e-4 |
+| `bfloat16` | 1e-2 | 2⁻⁷ ≈ 7.81e-3 |
+| `float32` | 2e-5 | 2⁻¹³ ≈ 1.22e-4 |
+| 其他 dtype（fallback） | 2e-5 | 2⁻¹³ |
 
 ### 失败时的 JSON 输出
 
@@ -376,8 +483,10 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
     "rel_threshold": 1.22e-4,
     "small_value_threshold": 6.10e-5,
     "small_value_error": 9.31e-10,
-    "max_error_cap": 0.1,
-    "required_matched_ratio": 0.98,
+    "atol": 2.0e-5,
+    "rtol": 1.22e-4,
+    "max_error_cap_violation_count": 12,
+    "required_matched_ratio": 0.9,
     "total_finite": 1000,
     "matched_count": 950,
     "small_count": 0,
@@ -391,7 +500,7 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 }
 ```
 
-`checks` 三个布尔位标记每项判定是否独立通过，下游可直接据此分类失败原因（绝对误差爆点 / 离群点过多 / 平均误差偏大）。
+`checks` 三个布尔位标记每项判定是否独立通过，下游可直接据此分类失败原因（max_error_cap 违例 / 离群点过多 / 平均误差偏大）。
 
 ### 比对前置检查（按顺序，任一失败即判 fail）
 
