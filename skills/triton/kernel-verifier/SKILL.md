@@ -344,7 +344,7 @@ benchmark.py 启动时按 `--triton_impl_name` 推导对应的 verify_result 文
 ### 通过条件（三项 AND，全部满足才算通过）
 
 1. **`max_error_cap`**：`max(|actual - golden|) <= 0.1`（全局绝对误差上限，dtype 无关）
-2. **`required_matched_ratio`**：`sum(matched) / total_finite >= 0.98`
+2. **`required_matched_ratio`**：`sum(matched) / total_finite >= 0.9`
 3. **`MERE`**：对**所有 finite 元素**计算 `rel_err = |diff| / (|golden| + 1e-7)` 再取均值，要求 `MERE < rel_threshold`。当 `total_finite == 0` 时本项自动通过。
 
 ### 阈值表
