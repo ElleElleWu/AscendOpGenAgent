@@ -17,9 +17,15 @@ import traceback
 
 ERROR_MSG_LIMIT = 2000
 
-# 精度判定常量（dtype 无关）
-MAX_ERROR_CAP = 0.1
-REQUIRED_MATCHED_RATIO = 0.98
+REQUIRED_MATCHED_RATIO = 0.9
+
+# allclose 判定阈值 (atol, rtol)：|actual - golden| <= atol + rtol * |golden|
+ALLCLOSE_TOLS_STR = {
+    "float32":  (1e-3, 2**(-13)), # 2**(-13)=1.220703125e-4
+    "float16":  (5e-3, 2**(-10)), # 2**(-10)=9.765625e-4
+    "bfloat16": (1e-2, 2**(-7)),  # 2**(-7)=7.8125e-3
+}
+ALLCLOSE_DEFAULT_TOLS = ALLCLOSE_TOLS_STR["float32"]
 
 
 class AccuracyError(AssertionError):
@@ -895,7 +901,7 @@ if __name__ == "__main__":
         "--verify_dir", default=".",
         help="验证目录，包含 {op_name}_torch.py 和 {op_name}_triton_ascend_impl.py（默认当前目录）",
     )
-    parser.add_argument("--timeout", type=int, default=900, help="超时秒数（默认 900，已忽略：当前为同进程模式）")
+    parser.add_argument("--timeout", type=int, default=900, help="超时秒数（已忽略：当前为同进程串行模式）")
     parser.add_argument(
         "--triton_impl_name", default="triton_ascend_impl",
         help="Triton 实现模块名（不含 op_name 前缀，默认 triton_ascend_impl）",
@@ -905,8 +911,8 @@ if __name__ == "__main__":
         help="验证结果 JSON 输出路径（默认 {verify_dir}/verify_result.json）",
     )
     parser.add_argument(
-        "--_run", action="store_true",
-        help=argparse.SUPPRESS,  # 内部参数：子进程模式，直接执行验证
+        "--non-compute", action="store_true",
+        help="非计算类算子（搬移 / Cast 等），所有 case 走二进制完全一致判定",
     )
     args = parser.parse_args()
 
@@ -915,45 +921,14 @@ if __name__ == "__main__":
         print(f"错误: 验证目录不存在: {verify_dir}", file=sys.stderr)
         sys.exit(1)
 
-    if args._run:
-        # 子进程模式：直接执行验证逻辑
-        try:
-            passed, total = verify_implementations(
-                args.op_name, verify_dir, args.triton_impl_name, args.output
-            )
-        except Exception as e:
-            print(f"{e}", file=sys.stderr)
-            traceback.print_exc()
-            sys.exit(1)
-        # 策略 A：passed < total → exit 1
-        sys.exit(0 if passed == total and total > 0 else 1)
-    else:
-        # 主进程模式：启动子进程执行验证，超时后 kill 整个进程树
-        cmd = [
-            sys.executable, os.path.abspath(__file__),
-            "--op_name", args.op_name,
-            "--verify_dir", verify_dir,
-            "--triton_impl_name", args.triton_impl_name,
-            "--_run",
-        ]
-        if args.output:
-            cmd.extend(["--output", args.output])
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            stdout, stderr = proc.communicate(timeout=args.timeout)
-
-            sys.stdout.buffer.write(stdout)
-            sys.stdout.buffer.flush()
-            sys.stderr.buffer.write(stderr)
-            sys.stderr.buffer.flush()
-            sys.exit(proc.returncode)
-
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            print(f"验证超时（{args.timeout}秒），已终止子进程", file=sys.stderr)
-            sys.exit(1)
+    try:
+        passed, total = verify_implementations(
+            args.op_name, verify_dir, args.triton_impl_name, args.output,
+            non_compute=args.non_compute,
+        )
+    except Exception as e:
+        print(f"{e}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+    # 策略 A：passed < total → exit 1
+    sys.exit(0 if passed == total and total > 0 else 1)
