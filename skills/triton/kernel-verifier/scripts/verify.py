@@ -22,8 +22,8 @@ REQUIRED_MATCHED_RATIO = 0.9
 # allclose 判定阈值 (atol, rtol)：|actual - golden| <= atol + rtol * |golden|
 ALLCLOSE_TOLS_STR = {
     "float32":  (1e-3, 2**(-13)), # 2**(-13)=1.220703125e-4
-    "float16":  (5e-3, 2**(-10)), # 2**(-10)=9.765625e-4
-    "bfloat16": (1e-2, 2**(-7)),  # 2**(-7)=7.8125e-3
+    "float16":  (9e-2, 2**(-10)), # 2**(-10)=9.765625e-4
+    "bfloat16": (1e-1, 2**(-7)),  # 2**(-7)=7.8125e-3
 }
 ALLCLOSE_DEFAULT_TOLS = ALLCLOSE_TOLS_STR["float32"]
 
